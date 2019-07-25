@@ -1,3 +1,41 @@
+FROM debian:stretch-slim as build
+
+ENV MYSQL_MAJOR 5.6
+ENV MYSQL_VERSION 5.6.45
+
+RUN echo "deb http://repo.mysql.com/apt/debian/ stretch mysql-${MYSQL_MAJOR}" > /etc/apt/sources.list.d/mysql.list
+RUN echo "deb-src http://repo.mysql.com/apt/debian/ stretch mysql-${MYSQL_MAJOR}" > /etc/apt/sources.list.d/mysql-src.list
+
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg dirmngr && rm -rf /var/lib/apt/lists/*
+
+RUN set -ex; \
+# gpg: key 5072E1F5: public key "MySQL Release Engineering <mysql-build@oss.oracle.com>" imported
+	key='A4A9406876FCBD3C456770C88C718D3B5072E1F5'; \
+	export GNUPGHOME="$(mktemp -d)"; \
+	gpg --batch --keyserver ha.pool.sks-keyservers.net --recv-keys "$key"; \
+	gpg --batch --export "$key" > /etc/apt/trusted.gpg.d/mysql.gpg; \
+	gpgconf --kill all; \
+	rm -rf "$GNUPGHOME"; \
+	apt-key list > /dev/null
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+		dpkg-dev \
+		packaging-dev \
+	&& apt-get build-dep -y mysql-server=${MYSQL_VERSION} \
+	&& rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update \
+	&& cd /root && apt source mysql-server=${MYSQL_VERSION} \
+	&& rm -rf /var/lib/apt/lists/*
+
+COPY 01-fix-bug-14653594.patch /root/
+
+RUN cd /root/mysql-community-${MYSQL_VERSION} \
+	&& patch -p1 -R < /root/01-fix-bug-14653594.patch \
+	&& dpkg-buildpackage -b -uc \
+	&& rm -rf /root/mysql-community-${MYSQL_VERSION}
+
 FROM debian:stretch-slim
 
 # add our user and group first to make sure their IDs get assigned consistently, regardless of whatever dependencies get added
@@ -48,6 +86,8 @@ ENV MYSQL_VERSION 5.6.45-1debian9
 
 RUN echo "deb http://repo.mysql.com/apt/debian/ stretch mysql-${MYSQL_MAJOR}" > /etc/apt/sources.list.d/mysql.list
 
+COPY --from=build /root/*.deb /root/
+
 # the "/var/lib/mysql" stuff here is because the mysql-server postinst doesn't have an explicit way to disable the mysql_install_db codepath besides having a database already "configured" (ie, stuff in /var/lib/mysql/mysql)
 # also, we set debconf keys to make APT a little quieter
 RUN { \
@@ -55,8 +95,19 @@ RUN { \
 		echo mysql-community-server mysql-community-server/root-pass password ''; \
 		echo mysql-community-server mysql-community-server/re-root-pass password ''; \
 		echo mysql-community-server mysql-community-server/remove-test-db select false; \
-	} | debconf-set-selections \
-	&& apt-get update && apt-get install -y mysql-server="${MYSQL_VERSION}" && rm -rf /var/lib/apt/lists/* \
+	} | debconf-set-selections
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends $(apt-cache depends mysql-community-client=${MYSQL_VERSION} mysql-community-server=${MYSQL_VERSION} | awk '/Depends:/{print$2}' | grep -v -E '^<.*>' | grep -v mysql | sort -u) \
+	&& apt-get install -y --no-install-recommends procps \
+	&& cd /root \
+	&& dpkg -i \
+		mysql-common_${MYSQL_VERSION}_amd64.deb \
+		mysql-community-client_${MYSQL_VERSION}_amd64.deb \
+		mysql-client_${MYSQL_VERSION}_amd64.deb \
+		mysql-community-server_${MYSQL_VERSION}_amd64.deb \
+		mysql-server_${MYSQL_VERSION}_amd64.deb \
+	&& rm -rf /var/lib/apt/lists/* \
 	&& rm -rf /var/lib/mysql && mkdir -p /var/lib/mysql /var/run/mysqld \
 	&& chown -R mysql:mysql /var/lib/mysql /var/run/mysqld \
 # ensure that /var/run/mysqld (used for socket and lock files) is writable regardless of the UID our mysqld instance ends up having at runtime

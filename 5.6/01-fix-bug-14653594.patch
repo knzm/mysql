@@ -1,0 +1,1087 @@
+From dc9284e401523180154bc874238b749ee0535c10 Mon Sep 17 00:00:00 2001
+From: Christopher Powers <chris.powers@oracle.com>
+Date: Thu, 21 Mar 2019 18:05:35 -0500
+Subject: [PATCH] Bug#27167197 USING ? IN INSTALL PLUGIN QUERY ABORTS DEBUG,
+ AND HANGS OPTIMIZED SERVER
+
+Backport of Bug#14653594 "INSTALL PLUGIN" HANGS SERVER WITH INVALID UTF8 CHARACTERS IN PATH
+
+Approved by: Sinisa Milivojevic <sinisa.milivojevic@oracle.com>
+---
+ client/mysqltest.cc               |  44 ++--
+ include/m_ctype.h                 |   5 +-
+ mysql-test/r/loaddata.result      |   2 +-
+ mysql-test/t/loaddata.test        |   3 +-
+ sql/debug_sync.cc                 |  93 +++++--
+ sql/sql_load.cc                   |  37 ++-
+ sql/sql_plugin.cc                 |   5 +-
+ sql/sql_show.cc                   |   7 +-
+ storage/federated/ha_federated.cc |  28 ++-
+ strings/ctype-mb.c                |   6 +-
+ strings/my_strchr.c               |  95 +++----
+ strings/my_vsnprintf.c            |   6 +-
+ unittest/gunit/CMakeLists.txt     |   3 +-
+ unittest/gunit/strings_utf8-t.cc  | 401 ++++++++++++++++++++++++++++++
+ 14 files changed, 609 insertions(+), 126 deletions(-)
+ create mode 100644 unittest/gunit/strings_utf8-t.cc
+
+diff --git a/client/mysqltest.cc b/client/mysqltest.cc
+index 1ae8f09606f..dfaa42957cf 100644
+--- a/client/mysqltest.cc
++++ b/client/mysqltest.cc
+@@ -1,4 +1,4 @@
+-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
++/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+ 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+@@ -6285,34 +6285,34 @@ int read_line(char *buf, int size)
+       /* Could be a multibyte character */
+       /* This code is based on the code in "sql_load.cc" */
+ #ifdef USE_MB
+-      int charlen = my_mbcharlen(charset_info, (unsigned char) c);
++      uint charlen = my_mbcharlen(charset_info, (unsigned char) c);
++      if (charlen == 0)
++        DBUG_RETURN(1);
+       /* We give up if multibyte character is started but not */
+       /* completed before we pass buf_end */
+       if ((charlen > 1) && (p + charlen) <= buf_end)
+       {
+-	int i;
+-	char* mb_start = p;
+-
+-	*p++ = c;
+-
+-	for (i= 1; i < charlen; i++)
+-	{
+-	  c= my_getc(cur_file->file);
+-	  if (feof(cur_file->file))
+-	    goto found_eof;
+-	  *p++ = c;
+-	}
+-	if (! my_ismbchar(charset_info, mb_start, p))
+-	{
+-	  /* It was not a multiline char, push back the characters */
+-	  /* We leave first 'c', i.e. pretend it was a normal char */
+-	  while (p-1 > mb_start)
+-	    my_ungetc(*--p);
+-	}
++	      char* mb_start = p;
++	      *p++ = c;
++
++	      for (uint i= 1; i < charlen; i++)
++	      {
++	        c= my_getc(cur_file->file);
++	        if (feof(cur_file->file))
++	          goto found_eof;
++	        *p++ = c;
++	      }
++	      if (! my_ismbchar(charset_info, mb_start, p))
++	      {
++	        /* It was not a multiline char, push back the characters */
++	        /* We leave first 'c', i.e. pretend it was a normal char */
++	        while (p-1 > mb_start)
++	          my_ungetc(*--p);
++	      }
+       }
+       else
+ #endif
+-	*p++= c;
++      	*p++= c;
+     }
+   }
+   die("The input buffer is too small for this query.x\n" \
+diff --git a/include/m_ctype.h b/include/m_ctype.h
+index f6933edd3c9..01ff8da7ae5 100644
+--- a/include/m_ctype.h
++++ b/include/m_ctype.h
+@@ -1,4 +1,4 @@
+-/* Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
++/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+ 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+@@ -688,7 +688,8 @@ extern my_bool my_parse_charset_xml(MY_CHARSET_LOADER *loader,
+ extern char *my_strchr(const CHARSET_INFO *cs, const char *str,
+                        const char *end, pchar c);
+ extern size_t my_strcspn(const CHARSET_INFO *cs, const char *str,
+-                         const char *end, const char *accept);
++                         const char *end, const char *reject,
++                         int reject_length);
+ 
+ my_bool my_propagate_simple(const CHARSET_INFO *cs, const uchar *str,
+                             size_t len);
+diff --git a/mysql-test/r/loaddata.result b/mysql-test/r/loaddata.result
+index 3cf3ae3c115..ef4d45849e1 100644
+--- a/mysql-test/r/loaddata.result
++++ b/mysql-test/r/loaddata.result
+@@ -507,7 +507,7 @@ DROP TABLE t1;
+ # Bug#11765139  58069: LOAD DATA INFILE: VALGRIND REPORTS INVALID MEMORY READS AND WRITES WITH U
+ #
+ CREATE TABLE t1(f1 INT);
+-SELECT 0xE1BB30 INTO OUTFILE 't1.dat';
++SELECT 0xE1C330 INTO OUTFILE 't1.dat';
+ LOAD DATA INFILE 't1.dat' IGNORE INTO TABLE t1 CHARACTER SET utf8;
+ DROP TABLE t1;
+ #
+diff --git a/mysql-test/t/loaddata.test b/mysql-test/t/loaddata.test
+index db21058daea..9006e277dc0 100644
+--- a/mysql-test/t/loaddata.test
++++ b/mysql-test/t/loaddata.test
+@@ -1,6 +1,7 @@
+ #
+ # Some simple test of load data
+ #
++--source include/have_utf8.inc
+ 
+ --disable_warnings
+ drop table if exists t1, t2;
+@@ -610,7 +611,7 @@ disconnect con1;
+ --echo #
+ 
+ CREATE TABLE t1(f1 INT);
+-EVAL SELECT 0xE1BB30 INTO OUTFILE 't1.dat';
++EVAL SELECT 0xE1C330 INTO OUTFILE 't1.dat';
+ --disable_warnings
+ LOAD DATA INFILE 't1.dat' IGNORE INTO TABLE t1 CHARACTER SET utf8;
+ --enable_warnings
+diff --git a/sql/debug_sync.cc b/sql/debug_sync.cc
+index 1c977f38dd3..2f0a6cb97ef 100644
+--- a/sql/debug_sync.cc
++++ b/sql/debug_sync.cc
+@@ -1,4 +1,4 @@
+-/* Copyright (c) 2009, 2013, Oracle and/or its affiliates. All rights reserved.
++/* Copyright (c) 2009, 2019, Oracle and/or its affiliates. All rights reserved.
+ 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+@@ -1161,6 +1161,58 @@ static bool debug_sync_set_action(THD *thd, st_debug_sync_action *action)
+ }
+ 
+ 
++/*
++  Advance the pointer by length of multi-byte character.
++
++    @param    ptr   pointer to multibyte character.
++
++    @return   NULL or pointer after advancing pointer by the
++              length of multi-byte character pointed to.
++*/
++
++static inline const char *advance_mbchar_ptr(const char *ptr)
++{
++  uint clen= my_mbcharlen(system_charset_info, (uchar) *ptr);
++
++  return (clen != 0) ? ptr + clen : NULL;
++}
++
++
++/*
++  Skip whitespace characters from the beginning of the multi-byte string.
++
++  @param    ptr     pointer to the multi-byte string.
++
++  @return   a pointer to the first non-whitespace character or NULL if the
++            string consists from whitespace characters only.
++*/
++
++static inline const char *skip_whitespace(const char *ptr)
++{
++  while (ptr != NULL && *ptr && my_isspace(system_charset_info, *ptr))
++    ptr= advance_mbchar_ptr(ptr);
++
++  return ptr;
++}
++
++
++/*
++  Get pointer to end of token.
++
++  @param    ptr  pointer to start of token
++
++  @return   NULL or pointer to end of token.
++*/
++
++static inline const char *get_token_end_ptr(const char *ptr)
++{
++  while (ptr != NULL && *ptr && !my_isspace(system_charset_info, *ptr))
++    ptr= advance_mbchar_ptr(ptr);
++
++  return ptr;
++}
++
++
+ /**
+   Extract a token from a string.
+ 
+@@ -1216,22 +1268,21 @@ static char *debug_sync_token(char **token_p, uint *token_length_p, char *ptr)
+   DBUG_ASSERT(token_length_p);
+   DBUG_ASSERT(ptr);
+ 
++
+   /* Skip leading space */
+-  while (my_isspace(system_charset_info, *ptr))
+-    ptr+= my_mbcharlen(system_charset_info, (uchar) *ptr);
++  ptr= const_cast<char*>(skip_whitespace(ptr));
+ 
+-  if (!*ptr)
+-  {
+-    ptr= NULL;
+-    goto end;
+-  }
++  if (ptr == NULL || !*ptr)
++    return NULL;
+ 
+   /* Get token start. */
+   *token_p= ptr;
+ 
+   /* Find token end. */
+-  while (*ptr && !my_isspace(system_charset_info, *ptr))
+-    ptr+= my_mbcharlen(system_charset_info, (uchar) *ptr);
++  ptr= const_cast<char*>(get_token_end_ptr(ptr));
++
++  if (ptr == NULL)
++    return NULL;
+ 
+   /* Get token length. */
+   *token_length_p= ptr - *token_p;
+@@ -1239,21 +1290,19 @@ static char *debug_sync_token(char **token_p, uint *token_length_p, char *ptr)
+   /* If necessary, terminate token. */
+   if (*ptr)
+   {
+-    /* Get terminator character length. */
+-    uint mbspacelen= my_mbcharlen(system_charset_info, (uchar) *ptr);
++     char* tmp= ptr;
+ 
+-    /* Terminate token. */
+-    *ptr= '\0';
+-
+-    /* Skip the terminator. */
+-    ptr+= mbspacelen;
++    /* Advance by terminator character length. */
++    ptr= const_cast<char*>(advance_mbchar_ptr(ptr));
++    if (ptr != NULL)
++    {
++      /* Terminate token. */
++      *tmp= '\0';
+ 
+-    /* Skip trailing space */
+-    while (my_isspace(system_charset_info, *ptr))
+-      ptr+= my_mbcharlen(system_charset_info, (uchar) *ptr);
++      /* Skip trailing space */
++      ptr= const_cast<char*>(skip_whitespace(ptr));
++    }
+   }
+-
+- end:
+   return ptr;
+ }
+ 
+diff --git a/sql/sql_load.cc b/sql/sql_load.cc
+index 38dd4ed325e..a2b19bfe4f5 100644
+--- a/sql/sql_load.cc
++++ b/sql/sql_load.cc
+@@ -1,5 +1,5 @@
+ /*
+-   Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
++   Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+ 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+@@ -1625,16 +1625,27 @@ int READ_INFO::read_field()
+ 	}
+       }
+ #ifdef USE_MB
+-      if (my_mbcharlen(read_charset, chr) > 1 &&
+-          to + my_mbcharlen(read_charset, chr) <= end_of_buff)
++      uint ml= my_mbcharlen(read_charset, chr);
++      if (ml == 0)
++      {
++        error= 1;
++        return 1;
++      }
++
++      if (ml > 1 &&
++          to + ml <= end_of_buff)
+       {
+         uchar* p= to;
+-        int ml, i;
+         *to++ = chr;
+ 
+         ml= my_mbcharlen(read_charset, chr);
++        if (ml == 0)
++        {
++          error= 1;
++          return 1;
++        }
+ 
+-        for (i= 1; i < ml; i++) 
++        for (uint i= 1; i < ml; i++) 
+         {
+           chr= GET;
+           if (chr == my_b_EOF)
+@@ -1652,7 +1663,7 @@ int READ_INFO::read_field()
+                         (const char *)p,
+                         (const char *)to))
+           continue;
+-        for (i= 0; i < ml; i++)
++        for (uint i= 0; i < ml; i++)
+           PUSH(*--to);
+         chr= GET;
+       }
+@@ -1904,11 +1915,19 @@ int READ_INFO::read_value(int delim, String *val)
+   for (chr= GET; my_tospace(chr) != delim && chr != my_b_EOF;)
+   {
+ #ifdef USE_MB
+-    if (my_mbcharlen(read_charset, chr) > 1)
++    uint ml= my_mbcharlen(read_charset, chr);
++    if (ml == 0)
++    {
++      chr= my_b_EOF;
++      val->length(0);
++      return chr;
++    }
++
++    if (ml > 1)
+     {
+       DBUG_PRINT("read_xml",("multi byte"));
+-      int i, ml= my_mbcharlen(read_charset, chr);
+-      for (i= 1; i < ml; i++) 
++
++      for (uint i= 1; i < ml; i++)
+       {
+         val->append(chr);
+         /*
+diff --git a/sql/sql_plugin.cc b/sql/sql_plugin.cc
+index 35a8b11789f..ea29c3a3e4e 100644
+--- a/sql/sql_plugin.cc
++++ b/sql/sql_plugin.cc
+@@ -1,5 +1,5 @@
+ /*
+-   Copyright (c) 2005, 2017, Oracle and/or its affiliates. All rights reserved.
++   Copyright (c) 2005, 2019, Oracle and/or its affiliates. All rights reserved.
+ 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+@@ -326,7 +326,8 @@ static void report_error(int where_to, uint error, ...)
+  */
+ bool check_valid_path(const char *path, size_t len)
+ {
+-  size_t prefix= my_strcspn(files_charset_info, path, path + len, FN_DIRSEP);
++  size_t prefix= my_strcspn(files_charset_info, path, path + len, FN_DIRSEP,
++                            strlen(FN_DIRSEP));
+   return  prefix < len;
+ }
+ 
+diff --git a/sql/sql_show.cc b/sql/sql_show.cc
+index 4a73a0de167..0558e296925 100644
+--- a/sql/sql_show.cc
++++ b/sql/sql_show.cc
+@@ -1,4 +1,4 @@
+-/* Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
++/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+ 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+@@ -1102,15 +1102,14 @@ mysqld_list_fields(THD *thd, TABLE_LIST *table_list, const char *wild)
+ 
+ static const char *require_quotes(const char *name, uint name_length)
+ {
+-  uint length;
+   bool pure_digit= TRUE;
+   const char *end= name + name_length;
+ 
+   for (; name < end ; name++)
+   {
+     uchar chr= (uchar) *name;
+-    length= my_mbcharlen(system_charset_info, chr);
+-    if (length == 1 && !system_charset_info->ident_map[chr])
++    uint length= my_mbcharlen(system_charset_info, chr);
++    if (length == 0 || (length == 1 && !system_charset_info->ident_map[chr]))
+       return name;
+     if (length == 1 && (chr < '0' || chr > '9'))
+       pure_digit= FALSE;
+diff --git a/storage/federated/ha_federated.cc b/storage/federated/ha_federated.cc
+index 5c17c8736d4..011afd5bfae 100644
+--- a/storage/federated/ha_federated.cc
++++ b/storage/federated/ha_federated.cc
+@@ -1,4 +1,4 @@
+-/* Copyright (c) 2004, 2016, Oracle and/or its affiliates. All rights reserved.
++/* Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+ 
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+@@ -523,8 +523,8 @@ int federated_done(void *p)
+   @brief Append identifiers to the string.
+ 
+   @param[in,out] string	The target string.
+-  @param[in] name 		Identifier name
+-  @param[in] length 	Length of identifier name in bytes
++  @param[in] name       Identifier name
++  @param[in] length     Length of identifier name in bytes
+   @param[in] quote_char Quote char to use for quoting identifier.
+ 
+   @return Operation Status
+@@ -538,32 +538,36 @@ int federated_done(void *p)
+ static bool append_ident(String *string, const char *name, size_t length,
+                          const char quote_char)
+ {
+-  bool result;
+-  uint clen;
+-  const char *name_end;
++  bool result= true;
+   DBUG_ENTER("append_ident");
+ 
+   if (quote_char)
+   {
+-    string->reserve((uint) length * 2 + 2);
++    string->reserve(length * 2 + 2);
++
+     if ((result= string->append(&quote_char, 1, system_charset_info)))
+       goto err;
+ 
+-    for (name_end= name+length; name < name_end; name+= clen)
++    uint clen= 0;
++
++    for (const char *name_end= name + length; name < name_end; name+= clen)
+     {
+-      uchar c= *(uchar *) name;
++      char c= *name;
++
+       if (!(clen= my_mbcharlen(system_charset_info, c)))
+-        clen= 1;
+-      if (clen == 1 && c == (uchar) quote_char &&
++        goto err;
++
++      if (clen == 1 && c == quote_char &&
+           (result= string->append(&quote_char, 1, system_charset_info)))
+         goto err;
++
+       if ((result= string->append(name, clen, string->charset())))
+         goto err;
+     }
+     result= string->append(&quote_char, 1, system_charset_info);
+   }
+   else
+-    result= string->append(name, (uint) length, system_charset_info);
++    result= string->append(name, length, system_charset_info);
+ 
+ err:
+   DBUG_RETURN(result);
+diff --git a/strings/ctype-mb.c b/strings/ctype-mb.c
+index faac2c94335..011dac3ae31 100644
+--- a/strings/ctype-mb.c
++++ b/strings/ctype-mb.c
+@@ -1,4 +1,4 @@
+-/* Copyright (c) 2002, 2016, Oracle and/or its affiliates. All rights reserved.
++/* Copyright (c) 2002, 2019, Oracle and/or its affiliates. All rights reserved.
+ 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+@@ -227,10 +227,10 @@ int my_strcasecmp_mb(const CHARSET_INFO *cs,const char *s, const char *t)
+     if ((l=my_ismbchar(cs, s, s + cs->mbmaxlen)))
+     {
+       while (l--)
+-        if (*s++ != *t++) 
++        if (*s++ != *t++)
+           return 1;
+     }
+-    else if (my_mbcharlen(cs, *t) > 1)
++    else if (my_mbcharlen(cs, *t) != 1)
+       return 1;
+     else if (map[(uchar) *s++] != map[(uchar) *t++])
+       return 1;
+diff --git a/strings/my_strchr.c b/strings/my_strchr.c
+index e658017dcc2..be9e192927c 100644
+--- a/strings/my_strchr.c
++++ b/strings/my_strchr.c
+@@ -1,4 +1,4 @@
+-/* Copyright (c) 2005, 2011, Oracle and/or its affiliates. All rights reserved.
++/* Copyright (c) 2005, 2019, Oracle and/or its affiliates. All rights reserved.
+ 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+@@ -17,57 +17,29 @@
+ #include "m_string.h"
+ #include "m_ctype.h"
+ 
+-#define NEQ(A, B) ((A) != (B))
+-#define EQU(A, B) ((A) == (B))
+ 
+-/**
+-  Macro for the body of the string scanning.
+-
+-  @param CS  The character set of the string
+-  @param STR Pointer to beginning of string
+-  @param END Pointer to one-after-end of string
+-  @param ACC Pointer to beginning of accept (or reject) string
+-  @param LEN Length of accept (or reject) string
+-  @param CMP is a function-like for doing the comparison of two characters.
+- */
+-
+-#define SCAN_STRING(CS, STR, END, ACC, LEN, CMP)                        \
+-  do {                                                                  \
+-    uint mbl;                                                           \
+-    const char *ptr_str, *ptr_acc;                                      \
+-    const char *acc_end= (ACC) + (LEN);                                 \
+-    for (ptr_str= (STR) ; ptr_str < (END) ; ptr_str+= mbl)              \
+-    {                                                                   \
+-      mbl= my_mbcharlen((CS), *(uchar*)ptr_str);                        \
+-      if (mbl < 2)                                                      \
+-      {                                                                 \
+-        DBUG_ASSERT(mbl == 1);                                          \
+-        for (ptr_acc= (ACC) ; ptr_acc < acc_end ; ++ptr_acc)            \
+-          if (CMP(*ptr_acc, *ptr_str))                                  \
+-            goto end;                                                   \
+-      }                                                                 \
+-    }                                                                   \
+-end:                                                                    \
+-    return (size_t) (ptr_str - (STR));                                  \
+-  } while (0)
++/*
++  Return pointer to first occurrence of character in a multi-byte string
++  or NULL if the character doesn't appear in the multi-byte string or
++  invalid character in charset of multi-byte string is found.
+ 
++  @param   cs    Pointer to charset info.
++  @param   str   Pointer to start of multi-byte string.
++  @param   end   Pointer to end of multi-byte string.
++  @param   c     Character to find first occurrence of.
+ 
+-/*
+-  my_strchr(cs, str, end, c) returns a pointer to the first place in
+-  str where c (1-byte character) occurs, or NULL if c does not occur
+-  in str. This function is multi-byte safe.
+-  TODO: should be moved to CHARSET_INFO if it's going to be called
+-  frequently.
++  @return  Pointer to first occurence of c in str or NULL.
+ */
+ 
+ char *my_strchr(const CHARSET_INFO *cs, const char *str, const char *end,
+                 pchar c)
+ {
+-  uint mbl;
+   while (str < end)
+   {
+-    mbl= my_mbcharlen(cs, *(uchar *)str);
+-    if (mbl < 2)
++    uint mbl= my_mbcharlen(cs, *(uchar *)str);
++    if (mbl == 0)
++      return NULL;
++    if (mbl == 1)
+     {
+       if (*str == c)
+         return((char *)str);
+@@ -79,14 +51,28 @@ char *my_strchr(const CHARSET_INFO *cs, const char *str, const char *end,
+   return(0);
+ }
+ 
++
+ /**
+   Calculate the length of the initial segment of 'str' which consists
+   entirely of characters not in 'reject'.
+ 
++  @param  cs              Pointer to charset info.
++  @param  str             Pointer to multi-byte string.
++  @param  str_end         Pointer to end of multi-byte string.
++  @param  reject          Pointer to start of single-byte reject string.
++  @param  reject_length   Length of single-byte reject string.
++
++  @return Length of segment of multi-byte string that doesn't contain
++          any character of the single-byte reject string or zero if an
++          invalid encoding of a character of the multi-byte string is
++          found.
++
+   @note The reject string points to single-byte characters so it is
+   only possible to find the first occurrence of a single-byte
+   character.  Multi-byte characters in 'str' are treated as not
+   matching any character in the reject string.
++  This method returns zero if an invalid encoding of any character
++  in the string 'str' using charset 'cs' is found.
+ 
+   @todo should be moved to CHARSET_INFO if it's going to be called
+   frequently.
+@@ -98,7 +84,28 @@ char *my_strchr(const CHARSET_INFO *cs, const char *str, const char *end,
+ */
+ 
+ size_t my_strcspn(const CHARSET_INFO *cs, const char *str,
+-                  const char *str_end, const char *reject)
++                  const char *str_end, const char *reject,
++                  int reject_length)
+ {
+-  SCAN_STRING(cs, str, str_end, reject, strlen(reject), EQU);
++  const char *ptr_str, *ptr_reject;
++  const char *reject_end= reject + reject_length;
++  uint mbl= 0;
++
++  for (ptr_str= str; ptr_str < str_end; ptr_str+= mbl)
++  {
++    mbl= my_mbcharlen(cs, *((uchar *) ptr_str));
++
++    if (mbl == 0)
++      return 0;
++
++    if (mbl == 1)
++    {
++      for (ptr_reject= reject; ptr_reject < reject_end; ++ptr_reject)
++      {
++        if (*ptr_reject == *ptr_str)
++          return (size_t) (ptr_str - str);
++      }
++    }
++  }
++  return (size_t) (ptr_str - str);
+ }
+diff --git a/strings/my_vsnprintf.c b/strings/my_vsnprintf.c
+index 8311340daac..f57d3ab3004 100644
+--- a/strings/my_vsnprintf.c
++++ b/strings/my_vsnprintf.c
+@@ -1,4 +1,4 @@
+-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
++/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+ 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+@@ -157,7 +157,7 @@ static char *backtick_string(const CHARSET_INFO *cs, char *to, char *end,
+   {
+     uchar c= *(uchar *) par;
+     if (!(char_len= my_mbcharlen(cs, c)))
+-      char_len= 1;
++      goto err;
+     if (char_len == 1 && c == (uchar) quote_char )
+     {
+       if (start + 1 >= end)
+@@ -168,7 +168,7 @@ static char *backtick_string(const CHARSET_INFO *cs, char *to, char *end,
+       goto err;
+     start= strnmov(start, par, char_len);
+   }
+-    
++
+   if (start + 1 >= end)
+     goto err;
+   *start++= quote_char;
+diff --git a/unittest/gunit/CMakeLists.txt b/unittest/gunit/CMakeLists.txt
+index a77080cac74..3d7f62377de 100644
+--- a/unittest/gunit/CMakeLists.txt
++++ b/unittest/gunit/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-# Copyright (c) 2010, 2016, Oracle and/or its affiliates. All rights reserved.
++# Copyright (c) 2010, 2019, Oracle and/or its affiliates. All rights reserved.
+ # 
+ # This program is free software; you can redistribute it and/or modify
+ # it under the terms of the GNU General Public License as published by
+@@ -303,6 +303,7 @@ SET(SERVER_TESTS
+   opt_trace
+   segfault
+   sql_table
++  strings_utf8
+   table_cache
+ )
+ 
+diff --git a/unittest/gunit/strings_utf8-t.cc b/unittest/gunit/strings_utf8-t.cc
+new file mode 100644
+index 00000000000..d9b00b4dfd8
+--- /dev/null
++++ b/unittest/gunit/strings_utf8-t.cc
+@@ -0,0 +1,401 @@
++/* Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; version 2 of the License.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#include "my_config.h"
++#include <gtest/gtest.h>
++
++
++#include <m_ctype.h>
++#include <sql_class.h>
++
++namespace strings_utf8_unittest {
++
++class StringsUTF8Test : public ::testing::Test
++{
++protected:
++  virtual void SetUp()
++  {
++    // Save global settings.
++    m_charset= system_charset_info;
++
++    system_charset_info= &my_charset_utf8_bin;
++  }
++
++  virtual void TearDown()
++  {
++    // Restore global settings.
++    system_charset_info= m_charset;
++  }
++
++private:
++  CHARSET_INFO *m_charset;
++};
++
++TEST_F(StringsUTF8Test, MyStrchr)
++{
++  const char* null_pos= NULL;
++  char* pos;
++  char valid_utf8_string[]= "str1";
++
++  /*
++    All valid utf8 characters in str arg passed to  my_strchr and  char to be
++    found not in str.
++  */
++
++  pos= my_strchr(system_charset_info, valid_utf8_string,
++                 valid_utf8_string + 3, 't');
++
++  EXPECT_EQ(valid_utf8_string + 1, pos);
++
++  /*
++    All valid utf8 characters in str arg passed to  my_strchr and  char to be
++    found not in str.
++  */
++  pos= my_strchr(system_charset_info, valid_utf8_string,
++                 valid_utf8_string + 3, 'd');
++
++  ASSERT_EQ(null_pos, pos);
++
++  // Assign an invalid utf8 char to valid_utf8_str
++  valid_utf8_string[0]= '\xff';
++
++  // Invalid utf8 character in str arg passed to my_strchr.
++  pos= my_strchr(system_charset_info, valid_utf8_string,
++                 valid_utf8_string + 3,'y');
++  ASSERT_EQ(null_pos, pos);
++
++}
++
++TEST_F(StringsUTF8Test, MyStrcasecmpMb)
++{
++  std::string utf8_src= "str";
++  std::string utf8_dst= "str";
++
++  EXPECT_EQ(0, my_strcasecmp_mb(system_charset_info, utf8_src.c_str(),
++                                utf8_dst.c_str()));
++
++  utf8_dst[1]= 'd';
++  
++  // src and dst are different utf8 strings
++  EXPECT_EQ(1, my_strcasecmp_mb(system_charset_info, utf8_src.c_str(),
++                                utf8_dst.c_str()));
++
++  // dst contain an invalid utf8 string
++  utf8_dst[1]= '\xFF';
++  EXPECT_EQ(1, my_strcasecmp_mb(system_charset_info, utf8_src.c_str(),
++                                utf8_dst.c_str()));
++}
++
++TEST_F(StringsUTF8Test, MyWellFormedLenUtf8)
++{
++  char utf8_src[32]= "\x00\x7f\xc2\x80\xdf\xbf\xe0\xa0\x80\xef\xbf\xbf";
++  int error;
++  
++  /* valid utf8 charaters, testing for boundry values */
++  EXPECT_EQ(12U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                            utf8_src,
++                                                            utf8_src + 12,
++                                                            6, &error));
++  ASSERT_EQ(0, error);
++
++  /* test for 0 length string */
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src,
++                                                           6, &error));
++  ASSERT_EQ(0, error);
++
++  /* test for illegal utf8 char */
++  utf8_src[0]= '\xc1';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 1,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xdf';
++  utf8_src[1]= '\x00';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 2,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xe0';
++  utf8_src[1]= '\xbf';
++  utf8_src[2]= '\x00';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 3,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xe0';
++  utf8_src[1]= '\x80';
++  utf8_src[2]= '\x80';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 3,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xf0';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 1,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xc2';
++  utf8_src[1]= '\x80';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 1,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xef';
++  utf8_src[1]= '\xbf';
++  utf8_src[2]= '\xbf';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 2,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++}
++
++TEST_F(StringsUTF8Test, MyIsmbcharUtf8)
++{
++  char utf8_src[8];
++
++  /* valid utf8 charaters, testing for boundry values */
++  utf8_src[0]= '\x00';
++  EXPECT_EQ(0U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 1));
++
++  utf8_src[0]= '\x7f';
++  EXPECT_EQ(0U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 1));
++
++  utf8_src[0]= '\xc2';
++  utf8_src[1]= '\x80';
++  EXPECT_EQ(2U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 2));
++
++  utf8_src[0]= '\xdf';
++  utf8_src[1]= '\xbf';
++  EXPECT_EQ(2U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 2));
++
++  utf8_src[0]= '\xe0';
++  utf8_src[1]= '\xa0';
++  utf8_src[2]= '\x80';
++  EXPECT_EQ(3U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 3));
++
++  utf8_src[0]= '\xef';
++  utf8_src[1]= '\xbf';
++  utf8_src[2]= '\xbf';
++  EXPECT_EQ(3U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 3));
++
++  /* Not testing for illegal charaters as same is tested in above test case */
++
++}
++
++class StringsUTF8mb4Test : public ::testing::Test
++{
++protected:
++  virtual void SetUp()
++  {
++    // Save global settings.
++    m_charset= system_charset_info;
++
++    system_charset_info= &my_charset_utf8mb4_bin;
++  }
++
++  virtual void TearDown()
++  {
++    // Restore global settings.
++    system_charset_info= m_charset;
++  }
++
++private:
++  CHARSET_INFO *m_charset;
++};
++
++TEST_F(StringsUTF8mb4Test, MyWellFormedLenUtf8mb4)
++{
++  char utf8_src[32]= "\x00\x7f\xc2\x80\xdf\xbf\xe0\xa0\x80\xef\xbf\xbf"
++                     "\xf0\x90\x80\x80\xF4\x8F\xBF\xBF";
++  int error;
++
++  /* valid utf8mb4 charaters, testing for boundry values */
++  EXPECT_EQ(20U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                            utf8_src,
++                                                            utf8_src + 20,
++                                                            8, &error));
++  ASSERT_EQ(0, error);
++
++  /* test for 0 length string */
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src, utf8_src,
++                                                           8, &error));
++  ASSERT_EQ(0, error);
++
++  /* test for illegal utf8mb4 char */
++  utf8_src[0]= '\xc1';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 1,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xdf';
++  utf8_src[1]= '\x00';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 2,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xe0';
++  utf8_src[1]= '\xbf';
++  utf8_src[2]= '\x00';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 3,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xe0';
++  utf8_src[1]= '\x80';
++  utf8_src[2]= '\x80';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 3,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xe0';
++  utf8_src[1]= '\xbf';
++  utf8_src[2]= '\x00';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 3,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xf0';
++  utf8_src[1]= '\x80';
++  utf8_src[2]= '\x80';
++  utf8_src[3]= '\x80';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 4,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xf4';
++  utf8_src[1]= '\x9f';
++  utf8_src[2]= '\x80';
++  utf8_src[3]= '\x80';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 4,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xf0';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 1,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xc2';
++  utf8_src[1]= '\x80';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 1,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xef';
++  utf8_src[1]= '\xbf';
++  utf8_src[2]= '\xbf';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 2,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++
++  utf8_src[0]= '\xf4';
++  utf8_src[1]= '\x8f';
++  utf8_src[2]= '\xbf';
++  utf8_src[3]= '\xbf';
++  EXPECT_EQ(0U, system_charset_info->cset->well_formed_len(system_charset_info,
++                                                           utf8_src,
++                                                           utf8_src + 2,
++                                                           1, &error));
++  ASSERT_EQ(1, error);
++}
++
++TEST_F(StringsUTF8mb4Test, MyIsmbcharUtf8mb4)
++{
++  char utf8_src[8];
++
++  /* valid utf8mb4 charaters, testing for boundry values */
++  utf8_src[0]= '\x00';
++  EXPECT_EQ(0U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src,utf8_src + 1));
++  utf8_src[0]= '\x7f';
++  EXPECT_EQ(0U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 1));
++  utf8_src[0]= '\xc2';
++  utf8_src[1]= '\x80';
++  EXPECT_EQ(2U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 2));
++  utf8_src[0]= '\xdf';
++  utf8_src[1]= '\xbf';
++  EXPECT_EQ(2U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 2));
++  utf8_src[0]= '\xe0';
++  utf8_src[1]= '\xa0';
++  utf8_src[2]= '\x80';
++  EXPECT_EQ(3U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 3));
++  utf8_src[0]= '\xef';
++  utf8_src[1]= '\xbf';
++  utf8_src[2]= '\xbf';
++  EXPECT_EQ(3U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 3));
++  utf8_src[0]= '\xf0';
++  utf8_src[1]= '\x90';
++  utf8_src[2]= '\x80';
++  utf8_src[3]= '\x80';
++  EXPECT_EQ(4U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 4));
++  utf8_src[0]= '\xf4';
++  utf8_src[1]= '\x8f';
++  utf8_src[2]= '\xbf';
++  utf8_src[3]= '\xbf';
++  EXPECT_EQ(4U, system_charset_info->cset->ismbchar(system_charset_info,
++                                                    utf8_src, utf8_src + 4));
++
++  /* Not testing for illegal charaters as same is tested in above test case */
++}
++
++}
